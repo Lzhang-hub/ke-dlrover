@@ -26,7 +26,6 @@ from dlrover.python.common.log import default_logger as logger
 try:
     from megatron.core import mpu, tensor_parallel
     from megatron.core.optimizer.optimizer import ChainedOptimizer
-    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
     from megatron.training import get_args
     from megatron.training.checkpointing import (
         check_checkpoint_args,
@@ -40,7 +39,7 @@ try:
         set_checkpoint_version,
         update_num_microbatches,
         get_distributed_optimizer_checkpoint_name,
-        generate_state_dict,
+        ensure_directory_exists,
     )
     from megatron.training.utils import print_rank_0, unwrap_model
 except ImportError:
@@ -58,8 +57,6 @@ except ImportError:
             read_metadata,
             set_checkpoint_version,
             update_num_microbatches,
-            get_distributed_optimizer_checkpoint_name,
-            generate_state_dict,
         )
         from megatron.optimizer.optimizer import ChainedOptimizer
         from megatron.utils import print_rank_0, unwrap_model
@@ -227,9 +224,9 @@ def save_checkpoint(
 
     # Checkpoint name.
     checkpoint_name = get_checkpoint_name(args.save, iteration,return_base_dir=args.use_dist_ckpt)
-    if args.use_distributed_optimizer and not args.no_save_optim and optimizer is not None and not args.use_dist_ckpt:
-        optim_checkpoint_name = \
-            get_distributed_optimizer_checkpoint_name(checkpoint_name)
+    optim_checkpoint_name = get_dist_optimizer_checkpoint_name(
+        args.save, iteration
+    )
 
     model_state_dict = {}
     dist_opter_state = {}
@@ -315,6 +312,47 @@ def get_dist_optimizer_checkpoint_name(
     return os.path.join(common_path, "distrib_optim.pt")
 
 
+# def get_dist_optimizer_checkpoint_name(checkpoints_path, iteration, release=False,
+#                         pipeline_parallel=None,
+#                         tensor_rank=None, pipeline_rank=None,
+#                         expert_parallel=None, expert_rank=None,
+#                         return_base_dir=False):
+#     """Determine the directory name for this rank's checkpoint."""
+#     if release:
+#         directory = 'release'
+#     else:
+#         directory = 'iter_{:07d}'.format(iteration)
+#     if return_base_dir:
+#         common_path = os.path.join(checkpoints_path, directory)
+#         return common_path
+
+#     # Use both the tensor and pipeline MP rank.
+#     if pipeline_parallel is None:
+#         pipeline_parallel = (mpu.get_pipeline_model_parallel_world_size() > 1)
+#     if tensor_rank is None:
+#         tensor_rank = mpu.get_tensor_model_parallel_rank()
+#     if pipeline_rank is None:
+#         pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+#     if expert_parallel is None:
+#         expert_parallel = (mpu.get_expert_model_parallel_world_size() > 1)
+#     if expert_rank is None:
+#         expert_rank = mpu.get_expert_model_parallel_rank()
+
+#     # Use both the tensor and pipeline MP rank. If using the distributed
+#     # optimizer, then the optimizer's path must additionally include the
+#     # data parallel rank.
+#     if not pipeline_parallel:
+#         common_path = os.path.join(checkpoints_path, directory,
+#                             f'mp_rank_{tensor_rank:02d}')
+#     else:
+#         common_path = os.path.join(checkpoints_path, directory,
+#                 f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}')
+
+#     if expert_parallel:
+#         common_path = common_path + f'_{expert_rank:03d}'
+
+#     return os.path.join(common_path, "distrib_optim.pt")
+
 def get_parameter_state(dist_optimizer):
     """Get parameter state (i.e., parameter & optimizer tensors).
 
@@ -361,137 +399,31 @@ def get_parameter_state(dist_optimizer):
                     state[bucket_idx][group_index][group_order] = tensors
     return state
 
-def get_dist_parameter_state(dist_optimizer):
-    """Get parameter state (i.e., parameter & optimizer tensors).
-
-    This method performs two steps:
-    - For each DP rank, copy param & optimizer shards to contiguous CPU
-        buffers (e.g., one buffer each for main_param, exp_avg, and
-        exp_avg_sq).
-    - Gather contiguous buffers on DP rank 0 and concatenate to world
-        buffers.
-    """
-
-    # Data parallelism variables.
-    data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo()
-    data_parallel_world_size = data_parallel_group_gloo.size()
-    data_parallel_rank = torch.distributed.get_rank(data_parallel_group_gloo)
-    data_parallel_group_gloo = data_parallel_group_gloo
-    data_parallel_global_ranks = torch.distributed.get_process_group_ranks(
-        data_parallel_group_gloo
-    )
-
-    # Collect param states.
-    state = {
-        "buckets_coalesced": True,
-    }
-
-    for gbuf_idx, gbuf_range_maps in enumerate(dist_optimizer.gbuf_ranges):
-
-        # Iterate grad buffers (by data type).
-        dtype_state = {}
-        assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
-        for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
-            buffer_numel_unpadded = dist_optimizer.buffers[gbuf_idx].numel_unpadded
-            # Create coalesced tensors for all state related to parameters in this buffer.
-            world_tensors = {}
-            if data_parallel_rank == 0:
-                world_tensors = {
-                    key: torch.empty(
-                        (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
-                    )
-                    for key in ("param", "exp_avg", "exp_avg_sq")
-                }
-                world_tensors["numel_unpadded"] = buffer_numel_unpadded
-            offset_in_world_tensors = 0
-            for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
-
-                # Compute local DP contiguous shard's size.
-                gbuf_world_numel = dist_optimizer.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
-                assert gbuf_world_numel % data_parallel_world_size == 0
-                gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
-
-                gbuf_world_numel_unpadded = (
-                    dist_optimizer.buffers[gbuf_idx].buckets[bucket_idx].numel_unpadded
-                )
-                assert gbuf_world_numel_unpadded <= gbuf_world_numel
-
-                local_shards = {
-                    key: torch.empty((gbuf_local_numel,), dtype=torch.float32, device="cpu")
-                    for key in ("param", "exp_avg", "exp_avg_sq")
-                }
-
-                # Build contiguous DP rank shards (for param + optim states).
-                for model_param, param_range_map in gbuf_range_map["param_map"].items():
-
-                    # Main param & optimizer states.
-                    group_index, group_order = dist_optimizer.model_param_group_index_map[model_param]
-                    main_param = dist_optimizer.optimizer.param_groups[group_index]["params"][group_order]
-                    optim_state = dist_optimizer.optimizer.state[main_param]
-
-                    tensors = {
-                        "param": main_param,
-                        **optim_state,
-                    }
-
-                    # Copy states into contiguous shard.
-                    gbuf_local_start = param_range_map["gbuf_local"].start
-                    gbuf_local_end = param_range_map["gbuf_local"].end
-                    for key in local_shards:
-                        local_shards[key][gbuf_local_start:gbuf_local_end].data.copy_(
-                            tensors[key].detach().cpu()
-                        )
-
-                # Gather contiguous shards on DP rank 0.
-                for key, send_tensor in local_shards.items():
-
-                    # Gather tensor list.
-                    if data_parallel_rank == 0:
-                        recv_tensors = [
-                            torch.empty((gbuf_local_numel,), dtype=torch.float32, device="cpu")
-                            for _ in range(data_parallel_world_size)
-                        ]
-                    else:
-                        recv_tensors = None
-
-                    # Gather.
-                    torch.distributed.gather(
-                        send_tensor,
-                        recv_tensors,
-                        data_parallel_global_ranks[0],
-                        data_parallel_group_gloo,
-                    )
-
-                    # Concatenate.
-                    if data_parallel_rank == 0:
-                        recv_tensors_concatenated = torch.cat(recv_tensors)
-                        # Copy this bucket's collected all-gather tensors into the right place in the
-                        # tensor for the buffer. The tensor for the buffer gets rid of the padding
-                        # between buckets.
-                        start = offset_in_world_tensors
-                        end = offset_in_world_tensors + gbuf_world_numel_unpadded
-                        world_tensors[key][start:end].copy_(
-                            recv_tensors_concatenated[:gbuf_world_numel_unpadded]
-                        )
-
-                offset_in_world_tensors += gbuf_world_numel_unpadded
-
-            # Collect world state.
-            dtype_state[dtype] = world_tensors
-        state[gbuf_idx] = dtype_state
-
-    return state
 
 def get_chained_optimizer_parameter_state(chained_optimizer):
     states = []
-    for optimizer in chained_optimizer.chained_optimizers:
-        if hasattr(optimizer, "get_parameter_state"):
-            state_dict = get_parameter_state(optimizer)
-            states.append(state_dict)
+    # for optimizer in chained_optimizer.chained_optimizers:
+    #     if hasattr(optimizer, "get_parameter_state"):
+    #         state_dict = get_parameter_state(optimizer)
+    #         states.append(state_dict)
+    #     else:
+    #         states.append(None)
+    # return states
+
+    for optimizer in chained_optimizer:
+        if hasattr(optimizer, 'get_parameter_state_dp_zero'):
+            state_dict = optimizer.get_parameter_state_dp_zero()
+
+            # Save checkpoint economically, only when DP rank = 0, state dict
+            # needs to be saved.
+            if torch.distributed.get_rank(optimizer.data_parallel_group) == 0:
+                states.append(state_dict)
+                save_states = True
+            else:
+                states.append(None)
         else:
             states.append(None)
     return states
-
 
 def load_checkpoint(
     model,
