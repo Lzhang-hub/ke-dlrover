@@ -239,29 +239,48 @@ def save_checkpoint(
         args.use_distributed_optimizer
         and not args.no_save_optim
         and optimizer is not None
-    ):  
+    ):
         if isinstance(optimizer, ChainedOptimizer):
             dist_opter_state = get_chained_optimizer_parameter_state(optimizer)
-        elif isinstance(optimizer, DistributedOptimizer):
-            dist_opter_state=get_dist_parameter_state(optimizer)
         else:
             dist_opter_state = get_parameter_state(optimizer)
-            
+
     # Collect args, model, RNG.
     if (
         not torch.distributed.is_initialized()
         or mpu.get_data_modulo_expert_parallel_rank() == 0
         or args.use_dist_ckpt
     ):
-        optim_sd_kwargs = {}
-        if args.use_dist_ckpt and args.use_distributed_optimizer:
-            optim_sd_kwargs['sharding_type'] = ('fully_sharded_bucket_space'
-                                                if args.ckpt_fully_parallel_save
-                                                else 'dp_zero_gather_scatter')
-            print_rank_0(f'Storing distributed optimizer sharded state of type {optim_sd_kwargs["sharding_type"]}')
-        model_state_dict=generate_state_dict(args, model, optimizer, opt_param_scheduler, rng_state,
-                                         args.use_dist_ckpt, iteration, optim_sd_kwargs=optim_sd_kwargs)
-        model_state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
+        # Arguments, iteration, and model.
+        model_state_dict["args"] = args
+        model_state_dict["checkpoint_version"] = 3.0
+        model_state_dict["iteration"] = iteration
+        model_state_dict[
+            "num_floating_point_operations_so_far"
+        ] = num_floating_point_operations_so_far
+        if len(model) == 1:
+            model_state_dict["model"] = model[
+                0
+            ].state_dict_for_save_checkpoint()
+        else:
+            for i in range(len(model)):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                model_state_dict["model%d" % i] = model[
+                    i
+                ].state_dict_for_save_checkpoint()
+
+        # Optimizer stuff.
+        if not args.no_save_optim:
+            if optimizer is not None:
+                model_state_dict["optimizer"] = optimizer.state_dict()
+            if opt_param_scheduler is not None:
+                model_state_dict[
+                    "opt_param_scheduler"
+                ] = opt_param_scheduler.state_dict()
+
+        # RNG states.
+        if not args.no_save_rng:
+            model_state_dict["rng_state"] = rng_state
 
     ckpt_sds = {}
     paths = {}
