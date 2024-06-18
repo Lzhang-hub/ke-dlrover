@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package elastic;
+
+enum TaskType {
+  NONE = 0;
+  TRAINING = 1;
+  EVALUATION = 2;
+  PREDICTION = 3;
+  WAIT = 4;
+  TRAIN_END_CALLBACK = 5;
+}
+
+message Response {
+  bool success = 1;
+  string reason = 2;
+}
+
+message Message {
+  int32 node_id = 1;
+  string node_type = 2;
+  // pickle bytes.
+  bytes data = 3;
+}
+
+service Master {
+  rpc report(Message) returns (Response);
+  rpc get(Message) returns (Message);
+}
